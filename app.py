@@ -1,67 +1,63 @@
+```python
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import Ridge, LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
+import joblib
+from tensorflow.keras.models import load_model
+import os
 
-app = FastAPI()
 
-# Load and preprocess data
-df = pd.read_csv('medical_cost.csv')
-X = df.drop(columns=['charges'])
-y = df['charges']
+# --------------------------------------------------
+# Create FastAPI application
+# --------------------------------------------------
 
-# Define preprocessing
-numeric_features = ['age', 'bmi', 'children']
-categorical_features = ['sex', 'smoker', 'region']
-numeric_transformer = StandardScaler()
-categorical_transformer = OneHotEncoder(handle_unknown='ignore')
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', numeric_transformer, numeric_features),
-        ('cat', categorical_transformer, categorical_features)
-    ]
+app = FastAPI(
+    title="Medical Insurance Cost Prediction API",
+    description="Hybrid Ridge Regression + FNN + Linear Regression API",
+    version="1.0.0"
 )
-X_preprocessed = preprocessor.fit_transform(X)
 
-# Train models
-X_train, X_test, y_train, y_test = train_test_split(X_preprocessed, y, test_size=0.2, random_state=42)
 
-lr_model = Ridge()
-lr_model.fit(X_train, y_train)
+# --------------------------------------------------
+# Model file paths
+# --------------------------------------------------
 
-fnn_model = Sequential([
-    Dense(128, input_dim=X_train.shape[1], activation='relu'),
-    Dropout(0.3),
-    Dense(64, activation='relu'),
-    Dropout(0.3),
-    Dense(32, activation='relu'),
-    Dense(1)
-])
-fnn_model.compile(optimizer='adam', loss='mean_squared_error')
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-fnn_model.fit(X_train, y_train, epochs=200, batch_size=32, validation_split=0.2, callbacks=[early_stopping])
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-train_preds_combined = np.column_stack((lr_model.predict(X_train), fnn_model.predict(X_train).flatten()))
-test_preds_combined = np.column_stack((lr_model.predict(X_test), fnn_model.predict(X_test).flatten()))
+PREPROCESSOR_PATH = os.path.join(BASE_DIR, "preprocessor.pkl")
+RIDGE_MODEL_PATH = os.path.join(BASE_DIR, "ridge_model.pkl")
+FNN_MODEL_PATH = os.path.join(BASE_DIR, "fnn_model.keras")
+META_MODEL_PATH = os.path.join(BASE_DIR, "meta_model.pkl")
 
-meta_model = LinearRegression()
-meta_model.fit(train_preds_combined, y_train)
 
-# Calculate metrics
-y_test_preds = meta_model.predict(test_preds_combined)
-mse = mean_squared_error(y_test, y_test_preds)
-mae = mean_absolute_error(y_test, y_test_preds)
-rmse = np.sqrt(mse)
-r2 = r2_score(y_test, y_test_preds)
+# --------------------------------------------------
+# Load trained models
+# --------------------------------------------------
+
+try:
+    preprocessor = joblib.load(PREPROCESSOR_PATH)
+    ridge_model = joblib.load(RIDGE_MODEL_PATH)
+    fnn_model = load_model(FNN_MODEL_PATH)
+    meta_model = joblib.load(META_MODEL_PATH)
+
+    models_loaded = True
+    model_error = None
+
+except Exception as e:
+    models_loaded = False
+    model_error = str(e)
+
+    preprocessor = None
+    ridge_model = None
+    fnn_model = None
+    meta_model = None
+
+
+# --------------------------------------------------
+# Input data model
+# --------------------------------------------------
 
 class UserInput(BaseModel):
     age: float
@@ -71,21 +67,107 @@ class UserInput(BaseModel):
     smoker: str
     region: str
 
+
+# --------------------------------------------------
+# Home endpoint
+# --------------------------------------------------
+
+@app.get("/")
+async def home():
+    return {
+        "message": "Medical Insurance Cost Prediction API",
+        "status": "running",
+        "models_loaded": models_loaded
+    }
+
+
+# --------------------------------------------------
+# Health check endpoint
+# --------------------------------------------------
+
+@app.get("/health")
+async def health():
+    if models_loaded:
+        return {
+            "status": "healthy",
+            "models_loaded": True
+        }
+
+    return JSONResponse(
+        {
+            "status": "error",
+            "models_loaded": False,
+            "error": model_error
+        },
+        status_code=500
+    )
+
+
+# --------------------------------------------------
+# Prediction endpoint
+# --------------------------------------------------
+
 @app.post("/predict/")
 async def predict(data: UserInput):
+
+    if not models_loaded:
+        return JSONResponse(
+            {
+                "error": "Models could not be loaded.",
+                "details": model_error
+            },
+            status_code=500
+        )
+
     try:
-        user_df = pd.DataFrame([data.dict()])
+
+        # Convert input into DataFrame
+        user_df = pd.DataFrame([
+            {
+                "age": data.age,
+                "bmi": data.bmi,
+                "children": data.children,
+                "sex": data.sex,
+                "smoker": data.smoker,
+                "region": data.region
+            }
+        ])
+
+        # Apply the same preprocessing used during training
         user_preprocessed = preprocessor.transform(user_df)
-        lr_pred = lr_model.predict(user_preprocessed)
-        fnn_pred = fnn_model.predict(user_preprocessed).flatten()
-        combined_pred = np.column_stack((lr_pred, fnn_pred))
+
+        # Ridge prediction
+        ridge_pred = ridge_model.predict(user_preprocessed)
+
+        # FNN prediction
+        fnn_pred = fnn_model.predict(
+            user_preprocessed,
+            verbose=0
+        ).flatten()
+
+        # Combine base-model predictions
+        combined_pred = np.column_stack(
+            (
+                ridge_pred,
+                fnn_pred
+            )
+        )
+
+        # Meta-model prediction
         final_pred = meta_model.predict(combined_pred)
-        return JSONResponse({
-            "predicted_cost": float(final_pred[0]),
-            "mse": mse,
-            "mae": mae,
-            "rmse": rmse,
-            "r2": r2
-        })
+
+        predicted_cost = float(final_pred[0])
+
+        return {
+            "predicted_cost": predicted_cost
+        }
+
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+
+        return JSONResponse(
+            {
+                "error": str(e)
+            },
+            status_code=400
+        )
+```
